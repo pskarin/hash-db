@@ -5,12 +5,13 @@ from fnmatch import fnmatch
 import hashlib
 import json
 from mmap import mmap, ACCESS_READ
-from os import fsdecode, fsencode, getcwd, lstat, readlink, stat_result
+from os import fsdecode, fsencode, getcwd, lstat, readlink, stat_result, getenv
 from os.path import normpath
 from pathlib import Path
 import re
 from stat import S_ISLNK, S_ISREG
 from sys import stderr
+from tqdm import tqdm
 
 try:
     from scandir import walk
@@ -18,10 +19,10 @@ except ImportError:
     from os import walk
 
 HASH_FILENAME = 'SHA512SUM'
-DB_FILENAME = 'hash_db.json'
+DB_DEFAULT_FILENAME = getenv('HASH_DB_DEFAULT_FILE') if getenv('HASH_DB_DEFAULT_FILE') else 'hash_db.json'
 # fnmatch patterns, specifically:
 IMPORT_FILENAME_PATTERNS = [
-    DB_FILENAME,
+    DB_DEFAULT_FILENAME,
     HASH_FILENAME,
     HASH_FILENAME + '.asc',
     '*.sha512sum',
@@ -64,24 +65,24 @@ def find_external_hash_files(path: Path):
             if any(fnmatch(filename, pattern) for pattern in IMPORT_FILENAME_PATTERNS):
                 yield dirpath / filename
 
-def find_hash_db_r(path: Path) -> Path:
+def find_hash_db_r(args, path: Path) -> Path:
     """
     Searches the given path and all of its parent
-    directories to find a filename matching DB_FILENAME
+    directories to find a filename matching args.jsondb
     """
     abs_path = path.absolute()
-    cur_path = abs_path / DB_FILENAME
+    cur_path = abs_path / args.jsondb
     if cur_path.is_file():
         return cur_path
     parent = abs_path.parent
     if parent != abs_path:
-        return find_hash_db_r(parent)
+        return find_hash_db_r(args, parent)
 
-def find_hash_db(path: Path):
-    hash_db_path = find_hash_db_r(path)
+def find_hash_db(args, path: Path):
+    hash_db_path = find_hash_db_r(args, path)
     if hash_db_path is None:
         message = "Couldn't find '{}' in '{}' or any parent directories"
-        raise FileNotFoundError(message.format(DB_FILENAME, path))
+        raise FileNotFoundError(message.format(args.jsondb, path))
     return hash_db_path
 
 def split_path(path: Path):
@@ -170,16 +171,17 @@ db_upgrades = [
 ]
 
 class HashDatabase:
-    def __init__(self, path: Path):
+    def __init__(self, args, path: Path):
+        self.args = args
         try:
-            self.path = find_hash_db(path).parent
+            self.path = find_hash_db(args, path).parent
         except FileNotFoundError:
             self.path = path
         self.entries = {}
         self.version = DATABASE_VERSION
 
     def save(self):
-        filename = self.path / DB_FILENAME
+        filename = self.path / self.args.jsondb
         data = {
             'version': self.version,
             'files': {
@@ -210,7 +212,7 @@ class HashDatabase:
         return copy
 
     def load(self):
-        filename = find_hash_db(self.path)
+        filename = find_hash_db(self.args, self.path)
         with filename.open(encoding='utf-8') as f:
             data = json.load(f)
         self.version = data['version']
@@ -265,7 +267,7 @@ class HashDatabase:
         for dirpath_str, _, filenames in walk(str(self.path)):
             dirpath = Path(dirpath_str)
             for filename in filenames:
-                if filename == DB_FILENAME:
+                if filename == self.args.jsondb:
                     continue
                 abs_filename = (dirpath / filename).absolute()
                 if abs_filename in self.entries:
@@ -292,9 +294,10 @@ class HashDatabase:
         [2] modified files
         """
         added, removed, modified = self._find_changes()
-        for entry in added:
-            entry.update()
-            self.entries[entry.filename] = entry
+        if len(added) > 0:
+          for entry in tqdm(added, desc ="Hasing new entries"):
+              entry.update()
+              self.entries[entry.filename] = entry
         for entry in removed:
             del self.entries[entry.filename]
         # Entries will appear in 'modified' if the size, mtime or type
@@ -302,11 +305,12 @@ class HashDatabase:
         # filesystems (like on USB flash drives), so only report files
         # as modified if the hash changes.
         content_modified = set()
-        for entry in modified:
-            old_hash = entry.hash
-            entry.update()
-            if entry.hash != old_hash:
-                content_modified.add(entry)
+        if len(modified) > 0:
+          for entry in tqdm(modified, desc ="Hasing modified entries"):
+              old_hash = entry.hash
+              entry.update()
+              if entry.hash != old_hash:
+                  content_modified.add(entry)
         return (
             {entry.filename for entry in added},
             {entry.filename for entry in removed},
@@ -390,7 +394,8 @@ def print_file_lists(added, removed, modified):
 def init(db, args):
     print('Initializing hash database')
     added, removed, modified = db.update()
-    print_file_lists(added, removed, modified)
+    if args.verbose:
+      print_file_lists(added, removed, modified)
     if not args.pretend:
         db.save()
 
@@ -398,7 +403,8 @@ def update(db, args):
     print('Updating hash database')
     db.load()
     added, removed, modified = db.update()
-    print_file_lists(added, removed, modified)
+    if args.verbose:
+      print_file_lists(added, removed, modified)
     if not args.pretend:
         db.save()
 
@@ -411,7 +417,7 @@ def import_hashes(db, args):
     print('Importing hashes')
     overall_count = 0
     for import_filename in find_external_hash_files(Path().absolute()):
-        if import_filename.name == DB_FILENAME:
+        if import_filename.name == args.jsondb:
             temp_db = HashDatabase(import_filename.parent)
             temp_db.load()
             count = len(temp_db.entries)
@@ -435,7 +441,7 @@ def split(db, args):
     db.load()
     new_db = db.split(args.subdir)
     new_db.save()
-    print('Wrote {} hash entries to {}'.format(len(new_db.entries), new_db.path / DB_FILENAME))
+    print('Wrote {} hash entries to {}'.format(len(new_db.entries), new_db.path / args.jsondb))
 
 def export(db, args):
     db.load()
@@ -445,21 +451,27 @@ def export(db, args):
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('-n', '--pretend', action='store_true')
+    parser.add_argument('-v', '--verbose', action='store_true')
     subparsers = parser.add_subparsers()
 
     parser_init = subparsers.add_parser('init')
+    parser_init.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_init.set_defaults(func=init)
 
     parser_update = subparsers.add_parser('update')
+    parser_update.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_update.set_defaults(func=update)
 
     parser_status = subparsers.add_parser('status')
+    parser_status.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_status.set_defaults(func=status)
 
     parser_import = subparsers.add_parser('import')
+    parser_import.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_import.set_defaults(func=import_hashes)
 
     parser_verify = subparsers.add_parser('verify')
+    parser_verify.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_verify.add_argument('--verbose-failures', action='store_true', help=('If hash '
         'verification fails, print filenames as soon as they are known in addition '
         'to the post-hashing summary.'))
@@ -469,12 +481,14 @@ if __name__ == '__main__':
     parser_verify.set_defaults(func=verify)
 
     parser_split = subparsers.add_parser('split')
+    parser_split.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_split.add_argument('subdir', type=Path)
     parser_split.set_defaults(func=split)
 
     parser_export = subparsers.add_parser('export')
+    parser_export.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_export.set_defaults(func=export)
 
     args = parser.parse_args()
-    db = HashDatabase(Path(getcwd()))
+    db = HashDatabase(args, Path(getcwd()))
     args.func(db, args)
