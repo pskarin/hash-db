@@ -392,7 +392,11 @@ def print_file_lists(added, removed, modified):
         print_file_list(modified)
 
 def init(db, args):
-    print('Initializing hash database')
+    try:
+      db.load()
+      print('Database exists, running update')
+    except FileNotFoundError:
+      print('Initializing hash database')
     added, removed, modified = db.update()
     if args.verbose:
       print_file_lists(added, removed, modified)
@@ -452,26 +456,22 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('-n', '--pretend', action='store_true')
     parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     subparsers = parser.add_subparsers()
 
     parser_init = subparsers.add_parser('init')
-    parser_init.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_init.set_defaults(func=init)
 
     parser_update = subparsers.add_parser('update')
-    parser_update.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_update.set_defaults(func=update)
 
     parser_status = subparsers.add_parser('status')
-    parser_status.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_status.set_defaults(func=status)
 
     parser_import = subparsers.add_parser('import')
-    parser_import.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_import.set_defaults(func=import_hashes)
 
     parser_verify = subparsers.add_parser('verify')
-    parser_verify.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_verify.add_argument('--verbose-failures', action='store_true', help=('If hash '
         'verification fails, print filenames as soon as they are known in addition '
         'to the post-hashing summary.'))
@@ -481,12 +481,10 @@ if __name__ == '__main__':
     parser_verify.set_defaults(func=verify)
 
     parser_split = subparsers.add_parser('split')
-    parser_split.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_split.add_argument('subdir', type=Path)
     parser_split.set_defaults(func=split)
 
     parser_export = subparsers.add_parser('export')
-    parser_export.add_argument('-j', '--jsondb', help='JSON data base file. Default: $(default)s', default=DB_DEFAULT_FILENAME)
     parser_export.set_defaults(func=export)
 
     args = parser.parse_args()
